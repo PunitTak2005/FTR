@@ -2,7 +2,10 @@ import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 
 // Use environment variable or default to local Uvicorn port
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+let API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+if (API_BASE_URL.endsWith('/')) {
+  API_BASE_URL = API_BASE_URL.slice(0, -1);
+}
 
 function App() {
   // Transaction Form State
