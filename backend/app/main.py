@@ -67,6 +67,14 @@ async def value_error_handler(request: Request, exc: ValueError):
 def startup_event():
     Base.metadata.create_all(bind=engine)
 
+@app.get("/")
+def read_root():
+    return {
+        "success": True,
+        "message": "Fair Transaction Ranking System API is active",
+        "docs": "/docs"
+    }
+
 @app.post("/transaction", response_model=TransactionResponse)
 @limiter.limit("30/minute")  # Moderate rate limiting for demo abuse prevention
 def create_transaction(
