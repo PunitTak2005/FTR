@@ -2,7 +2,15 @@ import os
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./fair_transaction.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    DATABASE_URL = os.getenv("POSTGRES_URL")
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite:///./fair_transaction.db"
+
+# SQLAlchemy 2.0+ requires 'postgresql://' instead of 'postgres://'
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 # For SQLite, we want to allow concurrent connections (using check_same_thread=False)
 # and use WAL mode for better concurrency handling.
