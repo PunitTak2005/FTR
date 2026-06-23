@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+ENV/
+env/
+*.db
+*.db-wal
+*.db-shm
+
+# Node / Vite
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# OS
+.DS_Store
+Thumbs.db
