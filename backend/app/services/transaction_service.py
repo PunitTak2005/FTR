@@ -22,7 +22,8 @@ def process_transaction(db: Session, request_id: str, user_id: str, amount: floa
     
     2. Concurrency Control:
        - Uses .with_for_update() to lock the User row.
-       - Implements a retry loop for SQLite lock contention (OperationalError).
+       - Implements a retry loop for SQLite lock contention (OperationalError) and User creation (IntegrityError).
+       - Uses nested transactions (Savepoints) to handle retries without rolling back the duplicate request.
     """
     max_retries = 3
     retry_delay = 0.1
@@ -55,7 +56,10 @@ def process_transaction(db: Session, request_id: str, user_id: str, amount: floa
                         # Refresh session
                         db.expire_all()
                         req_check = db.query(DuplicateRequest).filter(DuplicateRequest.request_id == request_id).first()
-                        if req_check and req_check.response_snapshot:
+                        if not req_check:
+                            # The original thread failed and deleted the pending record. Break and try processing.
+                            break
+                        if req_check.response_snapshot:
                             req_check.attempts += 1
                             db.commit()
                             
@@ -66,13 +70,13 @@ def process_transaction(db: Session, request_id: str, user_id: str, amount: floa
                                 db.rollback()
                                 
                             return json.loads(req_check.response_snapshot)
-                    
-                    raise ValueError("A transaction with this request_id is already in progress. Please try again.")
+                    else:
+                        raise ValueError("A transaction with this request_id is already in progress. Please try again.")
 
             # Request is new. Add a pending entry.
             pending_req = DuplicateRequest(request_id=request_id, user_id=user_id, response_snapshot=None)
             db.add(pending_req)
-            db.flush()
+            db.flush()  # Acquire database write lock early to serialize transactions
             break  # Successfully inserted pending request record
             
         except IntegrityError:
@@ -86,78 +90,69 @@ def process_transaction(db: Session, request_id: str, user_id: str, amount: floa
                 raise oe
             time.sleep(retry_delay * (2 ** attempt))
 
-    # Now we process the actual transaction
-    for attempt in range(max_retries):
-        try:
-            # Lock user row. If user doesn't exist, create user first, then lock.
-            user = db.query(User).filter(User.user_id == user_id).with_for_update().first()
-            if not user:
-                # Create user
-                user = User(user_id=user_id, balance=0.0)
-                db.add(user)
-                db.flush()
-                # Lock newly created user
-                user = db.query(User).filter(User.user_id == user_id).with_for_update().first()
-
-            # Execute transaction logic
-            if txn_type == "credit":
-                user.balance += amount
-            elif txn_type == "debit":
-                if user.balance < amount:
-                    # Rollback the pending request as transaction failed
-                    db.rollback()
-                    raise ValueError("Insufficient balance")
-                user.balance -= amount
-            else:
-                db.rollback()
-                raise ValueError("Invalid transaction type")
-
-            txn_id = f"txn_{uuid.uuid4().hex[:8]}"
-            txn = Transaction(
-                transaction_id=txn_id,
-                request_id=request_id,
-                user_id=user_id,
-                amount=amount,
-                type=txn_type
-            )
-            db.add(txn)
-            db.flush()
-
-            # Recalculate ranking metrics
-            recalculate_user_metrics(db, user_id)
-
-            # Format and save the response snapshot for idempotency
-            response_data = {
-                "success": True,
-                "transaction_id": txn_id,
-                "new_balance": round(user.balance, 2)
-            }
-            
-            # Fetch pending request inside the transaction to save snapshot
-            req_record = db.query(DuplicateRequest).filter(DuplicateRequest.request_id == request_id).first()
-            if req_record:
-                req_record.response_snapshot = json.dumps(response_data)
-            
-            db.commit()
-            return response_data
-
-        except OperationalError as oe:
-            db.rollback()
-            if attempt == max_retries - 1:
-                # Clean up the pending duplicate request record on final failure so user can retry
-                try:
-                    db.query(DuplicateRequest).filter(DuplicateRequest.request_id == request_id).delete()
-                    db.commit()
-                except Exception:
-                    db.rollback()
-                raise oe
-            time.sleep(retry_delay * (2 ** attempt))
-        except Exception as e:
-            db.rollback()
-            # Clean up pending request on general failure
+    # Now we process the actual transaction using nested transactions (Savepoints)
+    # to protect the outer pending request record from being rolled back during retries.
+    try:
+        for attempt in range(max_retries):
+            nested = db.begin_nested()
             try:
-                db.query(DuplicateRequest).filter(DuplicateRequest.request_id == request_id).delete()
+                # Lock user row. If user doesn't exist, create user first, then lock.
+                user = db.query(User).filter(User.user_id == user_id).with_for_update().first()
+                if not user:
+                    # Create user
+                    user = User(user_id=user_id, balance=0.0)
+                    db.add(user)
+                    db.flush()
+                    # Lock newly created user
+                    user = db.query(User).filter(User.user_id == user_id).with_for_update().first()
+
+                # Execute transaction logic
+                if txn_type == "credit":
+                    user.balance += amount
+                elif txn_type == "debit":
+                    if user.balance < amount:
+                        raise ValueError("Insufficient balance")
+                    user.balance -= amount
+                else:
+                    raise ValueError("Invalid transaction type")
+
+                txn_id = f"txn_{uuid.uuid4().hex[:8]}"
+                txn = Transaction(
+                    transaction_id=txn_id,
+                    request_id=request_id,
+                    user_id=user_id,
+                    amount=amount,
+                    type=txn_type
+                )
+                db.add(txn)
+                db.flush()
+
+                # Recalculate ranking metrics
+                recalculate_user_metrics(db, user_id)
+
+                # Format and save the response snapshot for idempotency
+                response_data = {
+                    "success": True,
+                    "transaction_id": txn_id,
+                    "new_balance": round(user.balance, 2)
+                }
+                
+                # Fetch pending request inside the transaction to save snapshot
+                req_record = db.query(DuplicateRequest).filter(DuplicateRequest.request_id == request_id).first()
+                if req_record:
+                    req_record.response_snapshot = json.dumps(response_data)
+                
+                nested.commit()
                 db.commit()
-            except Exception:
-                db.rollback()
-            raise e
+                return response_data
+
+            except (OperationalError, IntegrityError) as db_err:
+                nested.rollback()
+                if attempt == max_retries - 1:
+                    raise db_err
+                time.sleep(retry_delay * (2 ** attempt))
+    except Exception as e:
+        db.rollback()
+        raise e
+
+
